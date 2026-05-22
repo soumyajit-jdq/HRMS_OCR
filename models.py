@@ -33,14 +33,15 @@ class BankPassbook(BaseModel):
 class CancelCheck(BaseModel):
     account_number: str
     ifsc_code: str
+    check_number: str
 
 class BirthCertificate(BaseModel):
-    registration_number: str
     name: str
-    dob: str
-    registration_date: str
     gender: str
-    fathers_name: str
-    mothers_name: str
+    dob: str
+    father: str
+    mother: str
     place_of_birth: str
+    registration_number: str
+    registration_date: str
     
