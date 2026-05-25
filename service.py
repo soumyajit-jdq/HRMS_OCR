@@ -66,18 +66,22 @@ class ProcessingService:
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 num_pages = min(len(doc), max_pages)
                 if num_pages == 0:
-                    return []
+                    return [], ""
                 
                 all_images = []
+                extracted_text = ""
                 for i in range(num_pages):
                     page = doc[i]
+                    extracted_text += page.get_text() + "\n"
+                    # Use 2x scale (144 DPI) to avoid over-scaling scanned PDFs
+                    # Use PNG for lossless conversion before OCR compression
                     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    all_images.append(pix.tobytes("jpg"))
+                    all_images.append(pix.tobytes("png"))
                 doc.close()
-                return all_images
+                return all_images, extracted_text.strip()
             except Exception as e:
                 logger.error(f"PDF processing failed: {e}")
-                return []
+                return [], ""
         
         return await anyio.to_thread.run_sync(sync_pdf_process)
 
@@ -274,15 +278,114 @@ class ProcessingService:
 
     @staticmethod
     def extract_bank_passbook(text: str) -> dict:
-        data = {}
+        data = {
+            'customer_name': '',
+            'cif_no': '',
+            'account_number': '',
+            'branch_code': '',
+            'bank_name': '',
+            'ifsc_code': '',
+            'micr': ''
+        }
         
-        ac_match = re.search(r'(?:A/c No|Account No|Account Number)[\s:\.]*(\d{9,18})', text, re.IGNORECASE)
-        if ac_match:
-            data['account_number'] = ac_match.group(1)
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        
+        # Bank Name Heuristic
+        bank_names = ["State Bank of India", "HDFC Bank", "ICICI Bank", "Axis Bank", "Punjab National Bank", "Bank of Baroda", "Canara Bank", "Union Bank", "Bank of India"]
+        text_clean = re.sub(r'[\s\n\\]+', '', text).lower()
+        for b in bank_names:
+            if b.replace(' ', '').lower() in text_clean:
+                data['bank_name'] = b
+                break
+        if not data['bank_name']:
+            if re.search(r'State\s*Bank\s*of\s*[\\\|a-z]*ndia', text, re.IGNORECASE) or "osbi" in text.lower() or "psbi" in text.lower():
+                data['bank_name'] = "State Bank of India"
+
+        # Customer Name
+        name_match = re.search(r'(?:Customer Name|Name)[\s:]*(.*)', text, re.IGNORECASE)
+        if name_match:
+            data['customer_name'] = name_match.group(1).strip()
+
+        # Branch Code: allow spaces inside
+        branch_match = re.search(r'(?:Branch Code)[\s:]*([\d\s]+)', text, re.IGNORECASE)
+        if branch_match:
+            data['branch_code'] = branch_match.group(1).replace(' ', '').strip()
+        else:
+            for line in lines:
+                if "Branch Code" in line:
+                    match = re.search(r'(\d+)', line)
+                    if match:
+                        data['branch_code'] = match.group(1)
+                        break
+
+        # IFSC: allow noise characters
+        ifsc_label_match = re.search(r'IFSC[\s:]*([A-Z0-9\s~]+)', text, re.IGNORECASE)
+        if ifsc_label_match:
+            clean_ifsc = re.sub(r'[^A-Z0-9]', '', ifsc_label_match.group(1).upper())
+            if len(clean_ifsc) >= 11:
+                data['ifsc_code'] = clean_ifsc[:11]
+            elif len(clean_ifsc) >= 10:
+                data['ifsc_code'] = clean_ifsc
+        if not data['ifsc_code']:
+            ifsc_match = re.search(r'\b([A-Z]{4}0[A-Z0-9]{6})\b', text)
+            if ifsc_match:
+                data['ifsc_code'] = ifsc_match.group(1)
+
+        # MICR: allow noise and spaces
+        micr_label_match = re.search(r'(?:MICR|MI CR)[\s:]*([\d\s~]+)', text, re.IGNORECASE)
+        if micr_label_match:
+            clean_micr = re.sub(r'[^\d]', '', micr_label_match.group(1))
+            if len(clean_micr) >= 8:
+                data['micr'] = clean_micr[:9]
+        if not data['micr']:
+            micr_match = re.search(r'\b(\d{9})\b', text)
+            if micr_match and micr_match.group(1) not in (data.get('account_number'), data.get('cif_no')):
+                data['micr'] = micr_match.group(1)
+
+        # Queue-based extraction for CIF and Account numbers
+        # Handles cases where labels and values are stacked by OCR:
+        # CIF No
+        # Account No
+        # 123456789
+        # 987654321
+        queue = []
+        for line in lines:
+            # Check inline matches first
+            cif_inline = re.search(r'(?:CIF No|CIF Number)[\s:\.]*(\d{8,11})', line, re.IGNORECASE)
+            ac_inline = re.search(r'(?:A/c No|Account No|Account Number)[\s:\.]*(\d{9,18})', line, re.IGNORECASE)
             
-        ifsc_match = re.search(r'\b[A-Z]{4}0[A-Z0-9]{6}\b', text)
-        if ifsc_match:
-            data['ifsc_code'] = ifsc_match.group()
+            if cif_inline and not data['cif_no']:
+                data['cif_no'] = cif_inline.group(1)
+                continue
+            if ac_inline and not data['account_number']:
+                data['account_number'] = ac_inline.group(1)
+                continue
+                
+            # If not inline, maybe it's a standalone label
+            if re.search(r'(?:CIF No|CIF Number)', line, re.IGNORECASE) and not cif_inline:
+                if 'cif_no' not in queue: queue.append('cif_no')
+            elif re.search(r'(?:A/c No|Account No|Account Number)', line, re.IGNORECASE) and not ac_inline:
+                if 'account_number' not in queue: queue.append('account_number')
+            else:
+                # If it's a number, assign it to the next expected label in the queue
+                num_match = re.search(r'^(\d{8,18})$', line.replace(' ', ''))
+                if num_match and queue:
+                    target = queue.pop(0)
+                    if not data.get(target):
+                        data[target] = num_match.group(1)
+
+        # Fallback if both not found but we have long numbers scattered in text
+        if not data['cif_no'] and not data['account_number']:
+            long_nums = re.findall(r'\b\d{9,18}\b', text)
+            if len(long_nums) >= 2:
+                data['cif_no'] = long_nums[0]
+                data['account_number'] = long_nums[1]
+            elif len(long_nums) == 1:
+                data['account_number'] = long_nums[0]
+                
+        # Fix MICR if it matched Account or CIF by mistake
+        if data['micr'] and (data['micr'] == data['account_number'] or data['micr'] == data['cif_no']):
+            data['micr'] = ''
             
         return data
 

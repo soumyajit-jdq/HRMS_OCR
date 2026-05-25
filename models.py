@@ -26,9 +26,13 @@ class Passport(BaseModel):
     date_of_expiry: str
 
 class BankPassbook(BaseModel):
+    customer_name: str
+    cif_no: str
     account_number: str
-    ifsc_code: str
+    branch_code: str
     bank_name: str
+    ifsc_code: str
+    micr: str
 
 class CancelCheck(BaseModel):
     account_number: str

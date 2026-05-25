@@ -24,10 +24,25 @@ async def process_document(file: UploadFile, extractor_func):
         # 2. Extract Text via OCR
         # Handle PDFs by converting the first page to an image
         if file.content_type == "application/pdf" or file.filename.lower().endswith(".pdf"):
-            images = await ProcessingService.process_pdf_pages(file_bytes)
-            if not images:
-                raise HTTPException(status_code=400, detail="Could not extract images from PDF")
-            ocr_text = await ProcessingService.run_ocr(images[0])
+            images, pdf_text = await ProcessingService.process_pdf_pages(file_bytes)
+            if not images and not pdf_text:
+                raise HTTPException(status_code=400, detail="Could not extract contents from PDF")
+            
+            # Use native text from PDF if available (fast and 100% accurate)
+            if len(pdf_text) > 50:
+                ocr_text = pdf_text
+            else:
+                # Fallback to OCR. Process all pages instead of just the first one.
+                ocr_text = ""
+                for img in images:
+                    res = await ProcessingService.run_ocr(img)
+                    if not res.startswith("OCR Failed"):
+                        ocr_text += res + "\n"
+                    else:
+                        logger.warning(f"OCR failed for one PDF page: {res}")
+                
+                if not ocr_text.strip():
+                    ocr_text = "OCR Failed"
         else:
             ocr_text = await ProcessingService.run_ocr(file_bytes)
             
